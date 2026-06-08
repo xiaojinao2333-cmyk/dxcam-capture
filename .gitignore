@@ -1,0 +1,48 @@
+# 模型文件
+*.pt
+*.onnx
+*.engine
+*.tflite
+*.xml
+*.bin
+*.weights
+*.npy
+
+# OpenVINO 模型目录
+*_openvino_model/
+
+# TensorRT 模型
+*.engine
+
+# 数据集
+datasets/
+
+# CH9329 供应商资料（不需要上传）
+ch9329/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志
+*.log
+
+# 配置
+config.ini
+settings.json
+
+# Windows
+Thumbs.db
+Desktop.ini
