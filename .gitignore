@@ -17,7 +17,7 @@
 # 数据集
 datasets/
 
-# CH9329 供应商资料（不需要上传）
+# CH9329 供应商资料
 ch9329/
 
 # Python
@@ -46,3 +46,4 @@ settings.json
 # Windows
 Thumbs.db
 Desktop.ini
+.DS_Store
