@@ -5,7 +5,7 @@ import time
 import queue
 from collections import defaultdict, deque
 from rsr_ch9329 import create_mouse
-from dxcam_capture import DXCAMCapture
+from dxcam_server import DXCAMCapture
 
 PREDICTION_FRAMES = 8
 
@@ -80,12 +80,13 @@ capture = DXCAMCapture(region=capture_region, target_fps=120).init().start()
 
 def inference_thread():
     while not stop_event.is_set():
-        frame = capture.get_latest_frame()
+        frame, capture_ts = capture.get_frame()
         if frame is None:
             time.sleep(0.001)
             continue
 
-        capture_time = time.time()
+        infer_start_time = time.time()
+        capture_delay = (infer_start_time - capture_ts) * 1000
 
         results = ov_model.track(
             frame,
@@ -98,17 +99,27 @@ def inference_thread():
             device='cpu'
         )
 
-        inference_time = time.time()
-        latency = (inference_time - capture_time) * 1000
+        infer_end_time = time.time()
+        infer_latency = (infer_end_time - infer_start_time) * 1000
+        total_latency = (infer_end_time - capture_ts) * 1000
 
-        if not result_queue.full():
-            result_queue.put((frame, results, latency))
+        if result_queue.full():
+            try:
+                result_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+        result_queue.put((frame, results, capture_delay, infer_latency, total_latency, infer_end_time))
 
 inf_thread = __import__('threading').Thread(target=inference_thread, daemon=True)
 inf_thread.start()
 
 print("正在初始化 CH9329 鼠标...")
-mouse = create_mouse()
+try:
+    mouse = create_mouse()
+except Exception as e:
+    print(f"CH9329 鼠标初始化失败，继续只测试链路延迟: {e}")
+    mouse = None
 
 print("按 'q' 键退出...")
 prev_time = time.time()
@@ -116,9 +127,12 @@ prev_time = time.time()
 try:
     while True:
         try:
-            frame, results, latency = result_queue.get(timeout=0.5)
+            frame, results, capture_delay, infer_latency, total_latency, infer_ts = result_queue.get(timeout=0.5)
         except queue.Empty:
             continue
+
+        render_latency = (time.time() - infer_ts) * 1000
+        chain_latency = total_latency + render_latency
 
         annotated_frame = frame.copy()
         timestamp = time.time()
@@ -180,9 +194,15 @@ try:
 
         cv2.putText(annotated_frame, f"FPS: {int(real_fps)}", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(annotated_frame, f"Latency: {latency:.1f}ms", (20, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        cv2.imshow("YOLO26s DXCAM", annotated_frame)
+        cv2.putText(annotated_frame, f"Capture: {capture_delay:.1f}ms", (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(annotated_frame, f"Infer: {infer_latency:.1f}ms", (20, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(annotated_frame, f"RenderQ: {render_latency:.1f}ms", (20, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(annotated_frame, f"Chain: {chain_latency:.1f}ms", (20, 170),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.imshow("YOLO26s DXCAM Chain Latency", annotated_frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
