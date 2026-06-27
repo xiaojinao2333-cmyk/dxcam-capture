@@ -13,9 +13,9 @@ from dxcam_server import DXCAMCapture
 os.environ["OPENVINO_NUM_THREADS"] = "8"
 os.environ["OMP_NUM_THREADS"] = "8"
 
-# 模型选择: 用 nano 而不是 small，CPU 上快 3 倍
-MODEL_NAME = "yolo26n_int8.onnx"
-IMGSZ = 256  # 降低分辨率加速推理
+# 模型选择: 用 OpenVINO 格式，CPU 推理最快
+MODEL_NAME = "yolo26n_int8_openvino_model"
+IMGSZ = 256  # 小分辨率加速推理
 
 # 推理跳帧: 没目标时跳帧节省 CPU
 INFERENCE_SKIP_IDLE = 3   # 没目标时每 3 帧推理一次
@@ -25,7 +25,12 @@ PREDICTION_FRAMES = 8
 
 print(f"正在加载 {MODEL_NAME} 模型...")
 
-ov_model = YOLO(MODEL_NAME, task='detect')
+if not os.path.exists(f"{MODEL_NAME}/"):
+    print(f"OpenVINO 模型不存在，正在下载 yolo26n.pt 并导出 (imgsz={IMGSZ})...")
+    pt_model = YOLO("yolo26n.pt")
+    pt_model.export(format="openvino", imgsz=IMGSZ, int8=True)
+
+ov_model = YOLO(f"{MODEL_NAME}/", task='detect')
 
 print("正在预热模型...")
 dummy_frame = np.zeros((IMGSZ, IMGSZ, 3), dtype=np.uint8)
