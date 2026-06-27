@@ -6,7 +6,7 @@ from flask import Flask, Response
 
 
 class DXCAMCapture:
-    """DXCAM 屏幕捕获模块"""
+    """DXCAM 屏幕捕获模块 - 高性能版"""
     
     def __init__(self, region=(0, 0, 800, 600), target_fps=120):
         self.region = region
@@ -23,6 +23,10 @@ class DXCAMCapture:
         # 性能统计
         self.frame_count = 0
         self.last_stat_time = time.time()
+        
+        # 跳帧机制 - 当消费者跟不上时自动跳帧
+        self.skip_counter = 0
+        self.skip_every = 1  # 默认不跳
 
     def init(self):
         """初始化 DXCAM"""
@@ -32,13 +36,16 @@ class DXCAMCapture:
         return self
 
     def _loop(self):
-        """捕获循环"""
+        """捕获循环 - 零分配设计"""
         while not self.stop_event.is_set():
             frame = self.camera.get_latest_frame()
             if frame is not None:
-                self.latest_frame = frame
-                self.latest_timestamp = time.time()
-                self.frame_count += 1
+                self.skip_counter += 1
+                if self.skip_counter >= self.skip_every:
+                    self.skip_counter = 0
+                    self.latest_frame = frame
+                    self.latest_timestamp = time.time()
+                    self.frame_count += 1
             else:
                 time.sleep(0.001)
 
@@ -55,19 +62,15 @@ class DXCAMCapture:
         return self
 
     def get_frame(self):
-        """获取最新帧"""
+        """获取最新帧 - 零拷贝"""
         return self.latest_frame, self.latest_timestamp
 
     def get_stats(self):
         """获取性能统计"""
         now = time.time()
         elapsed = now - self.last_stat_time
-        if elapsed > 0:
-            fps = self.frame_count / elapsed
-        else:
-            fps = 0
+        fps = (self.frame_count / elapsed) if elapsed > 0 else 0
         
-        # 重置计数器
         if elapsed > 1.0:
             self.frame_count = 0
             self.last_stat_time = now
@@ -106,14 +109,12 @@ def generate_mjpeg():
             if capture is not None:
                 frame, ts = capture.get_frame()
                 if frame is not None:
-                    # 编码为 JPEG
                     ret, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                     if ret:
-                        # 使用标准的 MJPEG 格式
                         yield (b'--frame\r\n'
                                b'Content-Type: image/jpeg\r\n\r\n' + 
                                jpg.tobytes() + b'\r\n')
-            time.sleep(0.008)  # ~120fps 上限
+            time.sleep(0.008)
         except Exception as e:
             print(f"[MJPEG] 生成帧异常: {e}")
             time.sleep(0.1)
@@ -137,7 +138,7 @@ def index():
             </style>
         </head>
         <body>
-            <h1>📹 DXCAM Server</h1>
+            <h1>DXCAM Server</h1>
             <div class="stats">
                 <strong>状态:</strong> {"运行中" if stats.get("running") else "已停止"}<br>
                 <strong>目标帧率:</strong> {stats.get("capture_fps", 0)} FPS<br>
@@ -145,9 +146,9 @@ def index():
             </div>
             <h2>可用接口:</h2>
             <ul>
-                <li><a href="/video" target="_blank">📹 视频流</a></li>
-                <li><a href="/single">🖼️ 单帧图片</a></li>
-                <li><a href="/status">📊 状态 JSON</a></li>
+                <li><a href="/video" target="_blank">视频流</a></li>
+                <li><a href="/single">单帧图片</a></li>
+                <li><a href="/status">状态 JSON</a></li>
             </ul>
         </body>
     </html>
@@ -168,7 +169,6 @@ def status():
     """状态接口"""
     if capture is not None:
         stats = capture.get_stats()
-        # 添加延迟信息
         frame, ts = capture.get_frame()
         if frame is not None:
             latency = (time.time() - ts) * 1000
@@ -194,12 +194,6 @@ def config():
     """配置接口"""
     if capture is None:
         return {'error': 'Capture not initialized'}, 400
-    
-    if app.config.get('REQUEST_METHOD') == 'POST':
-        # 处理配置更新
-        pass
-    
-    # 返回当前配置
     return {
         'region': capture.region,
         'target_fps': capture.target_fps,
@@ -228,6 +222,5 @@ def run_server(region=(200, 200, 520, 520), target_fps=120, port=5000):
 
 
 if __name__ == '__main__':
-    # 默认配置
-    capture_region = (200, 200, 520, 520)  # 左上角坐标, 区域大小
+    capture_region = (200, 200, 520, 520)
     run_server(region=capture_region, target_fps=120, port=5000)

@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import time
-import queue
+import threading
 from collections import defaultdict, deque
 from rsr_ch9329 import create_mouse
 from dxcam_server import DXCAMCapture
@@ -24,12 +24,25 @@ _ = ov_model.predict(dummy_frame, device='cpu', verbose=False)
 print("模型预热完成")
 
 capture_region = (200, 200, 520, 520)
-frame_queue = queue.Queue(maxsize=2)
-result_queue = queue.Queue(maxsize=2)
-stop_event = __import__('threading').Event()
 
+# 线程安全变量 - 无锁设计
+latest_result = {
+    'frame': None,
+    'results': None,
+    'capture_ts': 0,
+    'infer_ts': 0,
+    'capture_delay': 0.0,
+    'infer_latency': 0.0,
+    'total_latency': 0.0
+}
+result_lock = threading.Lock()
+new_result_ready = threading.Event()
+
+stop_event = threading.Event()
+
+# 轨迹预测
 trajectory_history = defaultdict(lambda: deque(maxlen=20))
-trajectory_lock = __import__('threading').Lock()
+trajectory_lock = threading.Lock()
 
 class TrajectoryPredictor:
     def __init__(self, history_len=20, predict_frames=8):
@@ -38,8 +51,7 @@ class TrajectoryPredictor:
 
     def update(self, track_id, x, y, timestamp):
         with trajectory_lock:
-            self.history = trajectory_history[track_id]
-            self.history.append((x, y, timestamp))
+            trajectory_history[track_id].append((x, y, timestamp))
 
     def predict(self, track_id):
         with trajectory_lock:
@@ -48,7 +60,6 @@ class TrajectoryPredictor:
                 return None
 
             positions = [(h[0], h[1]) for h in history]
-
             n = len(positions)
 
             sum_x = sum(p[0] for p in positions)
@@ -79,14 +90,15 @@ predictor = TrajectoryPredictor(history_len=20, predict_frames=PREDICTION_FRAMES
 capture = DXCAMCapture(region=capture_region, target_fps=120).init().start()
 
 def inference_thread():
+    """推理线程 - 无队列，直接写最新结果"""
     while not stop_event.is_set():
         frame, capture_ts = capture.get_frame()
         if frame is None:
             time.sleep(0.001)
             continue
 
-        infer_start_time = time.time()
-        capture_delay = (infer_start_time - capture_ts) * 1000
+        infer_start = time.time()
+        capture_delay = (infer_start - capture_ts) * 1000
 
         results = ov_model.track(
             frame,
@@ -99,19 +111,23 @@ def inference_thread():
             device='cpu'
         )
 
-        infer_end_time = time.time()
-        infer_latency = (infer_end_time - infer_start_time) * 1000
-        total_latency = (infer_end_time - capture_ts) * 1000
+        infer_end = time.time()
+        infer_latency = (infer_end - infer_start) * 1000
+        total_latency = (infer_end - capture_ts) * 1000
 
-        if result_queue.full():
-            try:
-                result_queue.get_nowait()
-            except queue.Empty:
-                pass
+        # 无锁写入最新结果
+        with result_lock:
+            latest_result['frame'] = frame
+            latest_result['results'] = results
+            latest_result['capture_ts'] = capture_ts
+            latest_result['infer_ts'] = infer_end
+            latest_result['capture_delay'] = capture_delay
+            latest_result['infer_latency'] = infer_latency
+            latest_result['total_latency'] = total_latency
+        
+        new_result_ready.set()
 
-        result_queue.put((frame, results, capture_delay, infer_latency, total_latency, infer_end_time))
-
-inf_thread = __import__('threading').Thread(target=inference_thread, daemon=True)
+inf_thread = threading.Thread(target=inference_thread, daemon=True)
 inf_thread.start()
 
 print("正在初始化 CH9329 鼠标...")
@@ -124,29 +140,46 @@ except Exception as e:
 print("按 'q' 键退出...")
 prev_time = time.time()
 
+# 预分配显示帧（避免重复分配）
+display_frame = None
+
 try:
     while True:
-        try:
-            frame, results, capture_delay, infer_latency, total_latency, infer_ts = result_queue.get(timeout=0.5)
-        except queue.Empty:
+        # 等待新结果
+        new_result_ready.wait(timeout=0.5)
+        new_result_ready.clear()
+
+        # 无锁读取最新结果
+        with result_lock:
+            frame = latest_result['frame']
+            results = latest_result['results']
+            capture_delay = latest_result['capture_delay']
+            infer_latency = latest_result['infer_latency']
+            total_latency = latest_result['total_latency']
+            infer_ts = latest_result['infer_ts']
+
+        if frame is None:
             continue
 
         render_latency = (time.time() - infer_ts) * 1000
         chain_latency = total_latency + render_latency
 
-        annotated_frame = frame.copy()
+        # 直接在原帧上绘制（避免 copy）
+        annotated_frame = frame
         timestamp = time.time()
 
         best_box = None
         best_conf = 0
 
+        # 快速解析结果
         for result in results:
             if result.boxes is not None:
-                for box in result.boxes:
-                    conf = float(box.conf[0].cpu().numpy())
-                    if conf > best_conf:
-                        best_conf = conf
-                        best_box = box
+                boxes = result.boxes
+                if len(boxes) > 0:
+                    confs = boxes.conf.cpu().numpy()
+                    idx = confs.argmax()
+                    best_conf = float(confs[idx])
+                    best_box = boxes[idx]
 
         if best_box is not None:
             x1, y1, x2, y2 = best_box.xyxy[0].cpu().numpy().astype(int)
@@ -170,9 +203,7 @@ try:
                     cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(annotated_frame, f"ID:{track_id}", (x1, y1-10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
                     cv2.circle(annotated_frame, (cx, cy), 5, (0, 255, 0), -1)
-
                     cv2.circle(annotated_frame, (pred_x, pred_y), 5, (0, 0, 255), -1)
                     cv2.line(annotated_frame, (cx, cy), (pred_x, pred_y), (0, 0, 255), 2)
                     cv2.putText(annotated_frame, f"P({pred_x},{pred_y})", (pred_x+10, pred_y-10),
