@@ -3,29 +3,38 @@ import numpy as np
 from ultralytics import YOLO
 import time
 import threading
+import os
 from collections import defaultdict, deque
 from rsr_ch9329 import create_mouse
 from dxcam_server import DXCAMCapture
 
+# ========== 性能配置 ==========
+# OpenVINO 线程控制 - 充分利用 i3-12100F 的 8 线程
+os.environ["OPENVINO_NUM_THREADS"] = "8"
+os.environ["OMP_NUM_THREADS"] = "8"
+
+# 模型选择: 用 nano 而不是 small，CPU 上快 3 倍
+MODEL_NAME = "yolo26n_int8.onnx"
+IMGSZ = 256  # 降低分辨率加速推理
+
+# 推理跳帧: 没目标时跳帧节省 CPU
+INFERENCE_SKIP_IDLE = 3   # 没目标时每 3 帧推理一次
+INFERENCE_SKIP_TRACKING = 1  # 有目标时每帧推理
+
 PREDICTION_FRAMES = 8
 
-print("正在加载 YOLO26s 模型...")
+print(f"正在加载 {MODEL_NAME} 模型...")
 
-try:
-    ov_model = YOLO("yolo26s_int8_openvino_model/", task='detect')
-except:
-    model = YOLO("yolo26s.pt")
-    model.export(format="openvino", imgsz=320, int8=True)
-    ov_model = YOLO("yolo26s_int8_openvino_model/", task='detect')
+ov_model = YOLO(MODEL_NAME, task='detect')
 
 print("正在预热模型...")
-dummy_frame = np.zeros((320, 320, 3), dtype=np.uint8)
+dummy_frame = np.zeros((IMGSZ, IMGSZ, 3), dtype=np.uint8)
 _ = ov_model.predict(dummy_frame, device='cpu', verbose=False)
 print("模型预热完成")
 
 capture_region = (200, 200, 520, 520)
 
-# 线程安全变量 - 无锁设计
+# 线程安全变量
 latest_result = {
     'frame': None,
     'results': None,
@@ -37,7 +46,6 @@ latest_result = {
 }
 result_lock = threading.Lock()
 new_result_ready = threading.Event()
-
 stop_event = threading.Event()
 
 # 轨迹预测
@@ -90,11 +98,20 @@ predictor = TrajectoryPredictor(history_len=20, predict_frames=PREDICTION_FRAMES
 capture = DXCAMCapture(region=capture_region, target_fps=120).init().start()
 
 def inference_thread():
-    """推理线程 - 无队列，直接写最新结果"""
+    """推理线程 - 带自适应跳帧"""
+    frame_counter = 0
+    has_target = False
+    
     while not stop_event.is_set():
         frame, capture_ts = capture.get_frame()
         if frame is None:
             time.sleep(0.001)
+            continue
+
+        # 自适应跳帧: 没目标时跳帧省 CPU
+        frame_counter += 1
+        skip = INFERENCE_SKIP_IDLE if not has_target else INFERENCE_SKIP_TRACKING
+        if frame_counter % skip != 0:
             continue
 
         infer_start = time.time()
@@ -104,18 +121,24 @@ def inference_thread():
             frame,
             persist=True,
             tracker="bytetrack_optimized.yaml",
-            imgsz=320,
+            imgsz=IMGSZ,
             classes=[0],
             conf=0.6,
             verbose=False,
             device='cpu'
         )
 
+        # 检测是否有目标
+        has_target = False
+        for result in results:
+            if result.boxes is not None and len(result.boxes) > 0:
+                has_target = True
+                break
+
         infer_end = time.time()
         infer_latency = (infer_end - infer_start) * 1000
         total_latency = (infer_end - capture_ts) * 1000
 
-        # 无锁写入最新结果
         with result_lock:
             latest_result['frame'] = frame
             latest_result['results'] = results
@@ -140,16 +163,11 @@ except Exception as e:
 print("按 'q' 键退出...")
 prev_time = time.time()
 
-# 预分配显示帧（避免重复分配）
-display_frame = None
-
 try:
     while True:
-        # 等待新结果
         new_result_ready.wait(timeout=0.5)
         new_result_ready.clear()
 
-        # 无锁读取最新结果
         with result_lock:
             frame = latest_result['frame']
             results = latest_result['results']
@@ -164,14 +182,12 @@ try:
         render_latency = (time.time() - infer_ts) * 1000
         chain_latency = total_latency + render_latency
 
-        # 直接在原帧上绘制（避免 copy）
         annotated_frame = frame
         timestamp = time.time()
 
         best_box = None
         best_conf = 0
 
-        # 快速解析结果
         for result in results:
             if result.boxes is not None:
                 boxes = result.boxes
@@ -233,7 +249,7 @@ try:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         cv2.putText(annotated_frame, f"Chain: {chain_latency:.1f}ms", (20, 170),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.imshow("YOLO26s DXCAM Chain Latency", annotated_frame)
+        cv2.imshow("YOLO26n DXCAM", annotated_frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
